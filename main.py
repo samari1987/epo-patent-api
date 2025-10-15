@@ -80,7 +80,3 @@ def search_post(payload: dict = Body(...)):
 def search_get(q: str = Query(""), page: int = 1, size: int = 10):
     items = demo_items()[:min(size, 25)]
     return SearchResponse(total=len(items), page=page, size=min(size, 25), nextPage=None, items=items)
-
-    items = demo_items()[:min(size, 25)]
-    return SearchResponse(total=len(items), page=page, size=min(size, 25), nextPage=None, items=items)
-
