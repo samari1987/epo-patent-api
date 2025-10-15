@@ -1,40 +1,54 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Body, Query
 from pydantic import BaseModel
-import requests
-from requests.auth import HTTPBasicAuth
-import os
+from typing import List, Optional
 
-app = FastAPI(title="EPO Patent Search API", version="1.0")
+app = FastAPI(title="EPO Patent API", version="1.0.0")
 
-CONSUMER_KEY = os.getenv("CONSUMER_KEY")
-CONSUMER_SECRET = os.getenv("CONSUMER_SECRET")
+class PatentItem(BaseModel):
+    publicationNumber: str
+    kindCode: Optional[str] = None
+    country: Optional[str] = None
+    publicationDate: Optional[str] = None
+    titleOriginal: str
+    titleRu: Optional[str] = None
+    abstractOriginal: Optional[str] = None
+    abstractRu: Optional[str] = None
+    applicants: Optional[List[str]] = []
+    inventors: Optional[List[str]] = []
+    ipc: Optional[List[str]] = []
+    cpc: Optional[List[str]] = []
+    linkEspacenet: str
+    linkPdf: Optional[str] = None
 
-class SearchRequest(BaseModel):
-    query: str
-
-def get_access_token():
-    auth_url = "https://ops.epo.org/3.2/auth/accesstoken"
-    response = requests.post(
-        auth_url,
-        auth=HTTPBasicAuth(CONSUMER_KEY, CONSUMER_SECRET),
-        data={"grant_type": "client_credentials"},
-    )
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to get EPO token")
-    return response.json().get("access_token")
+class SearchResponse(BaseModel):
+    total: int
+    page: int
+    size: int
+    nextPage: Optional[int] = None
+    items: List[PatentItem]
 
 @app.get("/status")
 def status():
-    return {"status": "ok", "service": "EPO Patent Search"}
+    return {"status":"ok","service":"epo","version":"1.0.0"}
 
-@app.post("/search")
-def search_patents(request: SearchRequest):
-    token = get_access_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    url = f"https://ops.epo.org/3.2/rest-services/published-data/search?q=ti={request.query}"
-    response = requests.get(url, headers=headers)
+def demo_item() -> PatentItem:
+    return PatentItem(
+        publicationNumber="US12421136B1",
+        kindCode="B1",
+        country="US",
+        publicationDate="2022-01-10",
+        titleOriginal="Solar desalination system",
+        abstractOriginal="A system for solar-driven desalination using integrated photothermal and membrane modules...",
+        linkEspacenet="https://worldwide.espacenet.com/patent/search?q=pn%3DUS12421136B1"
+    )
 
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="EPO API request failed")
+@app.post("/search", response_model=SearchResponse)
+def search_post(payload: dict = Body(...)):
+    q = payload.get("query","")
+    page = int(payload.get("page",1))
+    size = min(int(payload.get("size",10)), 25)
+    return SearchResponse(total=1, page=page, size=size, nextPage=None, items=[demo_item()])
 
-    return {"query": request.query, "results": response.text}
+@app.get("/search", response_model=SearchResponse)
+def search_get(q: str = Query(""), page: int = 1, size: int = 10):
+    return SearchResponse(total=1, page=page, size=min(size,25), nextPage=None, items=[demo_item()])
