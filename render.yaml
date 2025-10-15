@@ -2,10 +2,7 @@ services:
   - type: web
     name: epo-patent-api
     env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
-    envVars:
-      - key: CONSUMER_KEY
-        sync: false
-      - key: CONSUMER_SECRET
-        sync: false
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /status
