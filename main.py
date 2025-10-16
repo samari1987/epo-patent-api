@@ -1,10 +1,11 @@
-# main.py — 25 результатов + автоперевод названия/абстракта
+# main.py — API для Научного Инноватора (25 патентов, сортировка по дате, автоперевод)
 from fastapi import FastAPI, Body, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from deep_translator import GoogleTranslator
+from datetime import datetime
 
-app = FastAPI(title="EPO Patent API", version="1.3.0")
+app = FastAPI(title="EPO Patent API", version="1.4.0")
 
 # ---------- модели ----------
 class PatentItem(BaseModel):
@@ -49,12 +50,19 @@ def _clip_en(text: Optional[str], n: int = 500) -> Optional[str]:
         return None
     return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "…"
 
+def _parse_date_safe(s: Optional[str]) -> datetime:
+    """Безопасное преобразование даты для сортировки"""
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except Exception:
+        return datetime(1900, 1, 1)
+
 # ---------- статус ----------
 @app.get("/status")
 def status():
-    return {"status": "ok", "service": "epo", "version": "1.3.0"}
+    return {"status": "ok", "service": "epo", "version": "1.4.0"}
 
-# ---------- демо-данные (размножаем до 25) ----------
+# ---------- демо-данные ----------
 def _demo_items_raw() -> List[PatentItem]:
     base = [
         PatentItem(
@@ -85,10 +93,14 @@ def _demo_items_raw() -> List[PatentItem]:
             linkEspacenet="https://worldwide.espacenet.com/patent/search?q=pn%3DCN120398169A"
         )
     ]
+    # создаём 25 уникальных элементов
     items: List[PatentItem] = []
-    for i in range(25):  # делаем 25 записей
+    for i in range(25):
         b = base[i % len(base)].model_copy(deep=True)
-        b.publicationNumber = f"{b.publicationNumber}-D{i+1}"  # уникализируем, чтобы строки не слипались
+        # немного смещаем дату публикации, чтобы сортировка имела смысл
+        date = _parse_date_safe(b.publicationDate)
+        b.publicationDate = (date.replace(year=date.year + (i % 3))).strftime("%Y-%m-%d")
+        b.publicationNumber = f"{b.publicationNumber}-D{i+1}"
         items.append(b)
     return items
 
@@ -98,17 +110,18 @@ def _demo_items_with_translation() -> List[PatentItem]:
         it.abstractOriginal = _clip_en(it.abstractOriginal, 500)
         it.titleRu = _translate_ru(it.titleOriginal)
         it.abstractRu = _translate_ru(it.abstractOriginal)
+    # сортируем по дате публикации (новые → старые)
+    items.sort(key=lambda x: _parse_date_safe(x.publicationDate), reverse=True)
     return items
 
 # ---------- поиск ----------
 @app.post("/search", response_model=SearchResponse)
 def search_post(payload: dict = Body(...)):
     page = int(payload.get("page", 1))
-    size = min(int(payload.get("size", 25)), 25)  # default 25
+    size = min(int(payload.get("size", 25)), 25)
     all_items = _demo_items_with_translation()
     return SearchResponse(total=len(all_items), page=page, size=size, nextPage=None, items=all_items[:size])
 
-# Для ручной проверки из браузера
 @app.get("/search", response_model=SearchResponse)
 def search_get(q: str = Query(""), page: int = 1, size: int = 25):
     size = min(size, 25)
