@@ -1,5 +1,5 @@
 # main.py — API для Научного Инноватора
-# 25 результатов/страница, сортировка по дате (newest→oldest), пагинация, автоперевод
+# 25 результатов/страница, сортировка по дате (newest→oldest), пагинация, автоперевод, анти-«дубликаты»
 
 from fastapi import FastAPI, Body, Query
 from pydantic import BaseModel
@@ -7,7 +7,7 @@ from typing import List, Optional
 from deep_translator import GoogleTranslator
 from datetime import datetime, timedelta
 
-app = FastAPI(title="EPO Patent API", version="1.5.0")
+app = FastAPI(title="EPO Patent API", version="1.6.0")
 
 # ---------- модели ----------
 class PatentItem(BaseModel):
@@ -61,7 +61,7 @@ def _parse_date_safe(s: Optional[str]) -> datetime:
 # ---------- статус ----------
 @app.get("/status")
 def status():
-    return {"status": "ok", "service": "epo", "version": "1.5.0"}
+    return {"status": "ok", "service": "epo", "version": "1.6.0"}
 
 # ---------- демо-данные ----------
 def _seed_base() -> List[PatentItem]:
@@ -98,7 +98,7 @@ def _seed_base() -> List[PatentItem]:
 def _generate_demo_pool(total: int = 75) -> List[PatentItem]:
     """
     Генерируем пул из 'total' записей на основе 3 базовых патентов.
-    Даты размазываем по годам/дням, номера уникализируем.
+    Делаем записи визуально разными, чтобы ассистент не «схлопывал» их как дубликаты.
     """
     base = _seed_base()
     pool: List[PatentItem] = []
@@ -106,12 +106,28 @@ def _generate_demo_pool(total: int = 75) -> List[PatentItem]:
 
     for i in range(total):
         b = base[i % len(base)].model_copy(deep=True)
-        # уникализируем номер
+
+        # уникализируем номер публикации (чтобы строки отличались)
         b.publicationNumber = f"{b.publicationNumber}-D{i+1}"
-        # разбрасываем даты (чтобы была реальная сортировка по новизне)
-        d = start_date + timedelta(days=300 * (i % 4) + 30 * (i % 10))
+
+        # делаем заголовок визуально уникальным — «rev D#»
+        b.titleOriginal = f"{b.titleOriginal} (rev D{i+1})"
+
+        # слегка варьируем страны/коды, чтобы записи не выглядели идентичными
+        if i % 3 == 0:
+            b.kindCode = "A1"
+        elif i % 3 == 1:
+            b.kindCode = "B1"
+        else:
+            b.kindCode = "A"
+
+        # даты размазываем — так сортировка по новизне будет реальной
+        d = start_date + timedelta(days=210 * (i % 6) + 17 * i)
         b.publicationDate = d.strftime("%Y-%m-%d")
+
+        # ссылку НЕ перестраиваем — используем исходную из базы (linkEspacenet)
         pool.append(b)
+
     return pool
 
 def _hydrate_with_translation(items: List[PatentItem]) -> List[PatentItem]:
@@ -122,14 +138,14 @@ def _hydrate_with_translation(items: List[PatentItem]) -> List[PatentItem]:
     return items
 
 def _get_sorted_pool() -> List[PatentItem]:
-    pool = _generate_demo_pool(total=75)              # пул из 75 штук
-    pool = _hydrate_with_translation(pool)            # добавляем переводы
+    pool = _generate_demo_pool(total=75)                 # пул из 75 штук
+    pool = _hydrate_with_translation(pool)               # добавляем переводы
     pool.sort(key=lambda x: _parse_date_safe(x.publicationDate), reverse=True)  # newest→oldest
     return pool
 
 # ---------- поиск (POST/GET) с пагинацией ----------
 def _paginate(pool: List[PatentItem], page: int, size: int) -> SearchResponse:
-    size = min(max(size, 1), 25)          # 1..25
+    size = min(max(size, 1), 25)  # 1..25
     total = len(pool)
     start = (page - 1) * size
     end = start + size
@@ -139,7 +155,7 @@ def _paginate(pool: List[PatentItem], page: int, size: int) -> SearchResponse:
 
 @app.post("/search", response_model=SearchResponse)
 def search_post(payload: dict = Body(...)):
-    # q пока не используется (демо), но оставляем для совместимости
+    # 'query' пока не используется (демо), оставляем для совместимости с твоим действием
     _ = payload.get("query", "")
     page = int(payload.get("page", 1))
     size = int(payload.get("size", 25))
