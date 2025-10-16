@@ -1,10 +1,10 @@
-# main.py — API для Научного Инноватора с автопереводом и size=25
+# main.py — 25 результатов + автоперевод названия/абстракта
 from fastapi import FastAPI, Body, Query
 from pydantic import BaseModel
 from typing import List, Optional
-from deep_translator import GoogleTranslator  # без ключа; есть лимиты, но для демо ок
+from deep_translator import GoogleTranslator
 
-app = FastAPI(title="EPO Patent API", version="1.1.0")
+app = FastAPI(title="EPO Patent API", version="1.3.0")
 
 # ---------- модели ----------
 class PatentItem(BaseModel):
@@ -38,7 +38,6 @@ def _translate_ru(text: Optional[str]) -> Optional[str]:
         return None
     try:
         t = _tr.translate(text.strip())
-        # укоротим до 500 символов по слову
         if t and len(t) > 500:
             t = t[:500].rsplit(" ", 1)[0] + "…"
         return t
@@ -53,11 +52,11 @@ def _clip_en(text: Optional[str], n: int = 500) -> Optional[str]:
 # ---------- статус ----------
 @app.get("/status")
 def status():
-    return {"status": "ok", "service": "epo", "version": "1.1.0"}
+    return {"status": "ok", "service": "epo", "version": "1.3.0"}
 
-# ---------- демо-данные (можно заменить реальным поиском позже) ----------
-def demo_items() -> List[PatentItem]:
-    items = [
+# ---------- демо-данные (размножаем до 25) ----------
+def _demo_items_raw() -> List[PatentItem]:
+    base = [
         PatentItem(
             publicationNumber="US12421136B1",
             kindCode="B1",
@@ -86,7 +85,15 @@ def demo_items() -> List[PatentItem]:
             linkEspacenet="https://worldwide.espacenet.com/patent/search?q=pn%3DCN120398169A"
         )
     ]
-    # автоперевод (мягкий фоллбэк)
+    items: List[PatentItem] = []
+    for i in range(25):  # делаем 25 записей
+        b = base[i % len(base)].model_copy(deep=True)
+        b.publicationNumber = f"{b.publicationNumber}-D{i+1}"  # уникализируем, чтобы строки не слипались
+        items.append(b)
+    return items
+
+def _demo_items_with_translation() -> List[PatentItem]:
+    items = _demo_items_raw()
     for it in items:
         it.abstractOriginal = _clip_en(it.abstractOriginal, 500)
         it.titleRu = _translate_ru(it.titleOriginal)
@@ -96,15 +103,14 @@ def demo_items() -> List[PatentItem]:
 # ---------- поиск ----------
 @app.post("/search", response_model=SearchResponse)
 def search_post(payload: dict = Body(...)):
-    q = payload.get("query", "")
     page = int(payload.get("page", 1))
-    size = min(int(payload.get("size", 25)), 25)  # по умолчанию 25
-    items = demo_items()[:size]
-    return SearchResponse(total=len(items), page=page, size=size, nextPage=None, items=items)
+    size = min(int(payload.get("size", 25)), 25)  # default 25
+    all_items = _demo_items_with_translation()
+    return SearchResponse(total=len(all_items), page=page, size=size, nextPage=None, items=all_items[:size])
 
-# для ручной проверки из браузера
+# Для ручной проверки из браузера
 @app.get("/search", response_model=SearchResponse)
 def search_get(q: str = Query(""), page: int = 1, size: int = 25):
     size = min(size, 25)
-    items = demo_items()[:size]
-    return SearchResponse(total=len(items), page=page, size=size, nextPage=None, items=items)
+    all_items = _demo_items_with_translation()
+    return SearchResponse(total=len(all_items), page=page, size=size, nextPage=None, items=all_items[:size])
