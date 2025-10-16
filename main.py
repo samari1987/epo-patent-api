@@ -1,11 +1,13 @@
-# main.py — API для Научного Инноватора (25 патентов, сортировка по дате, автоперевод)
+# main.py — API для Научного Инноватора
+# 25 результатов/страница, сортировка по дате (newest→oldest), пагинация, автоперевод
+
 from fastapi import FastAPI, Body, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from deep_translator import GoogleTranslator
-from datetime import datetime
+from datetime import datetime, timedelta
 
-app = FastAPI(title="EPO Patent API", version="1.4.0")
+app = FastAPI(title="EPO Patent API", version="1.5.0")
 
 # ---------- модели ----------
 class PatentItem(BaseModel):
@@ -51,7 +53,6 @@ def _clip_en(text: Optional[str], n: int = 500) -> Optional[str]:
     return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "…"
 
 def _parse_date_safe(s: Optional[str]) -> datetime:
-    """Безопасное преобразование даты для сортировки"""
     try:
         return datetime.strptime(s, "%Y-%m-%d")
     except Exception:
@@ -60,11 +61,11 @@ def _parse_date_safe(s: Optional[str]) -> datetime:
 # ---------- статус ----------
 @app.get("/status")
 def status():
-    return {"status": "ok", "service": "epo", "version": "1.4.0"}
+    return {"status": "ok", "service": "epo", "version": "1.5.0"}
 
 # ---------- демо-данные ----------
-def _demo_items_raw() -> List[PatentItem]:
-    base = [
+def _seed_base() -> List[PatentItem]:
+    return [
         PatentItem(
             publicationNumber="US12421136B1",
             kindCode="B1",
@@ -91,39 +92,61 @@ def _demo_items_raw() -> List[PatentItem]:
             titleOriginal="Photothermal solar desalination system",
             abstractOriginal="The invention discloses a photothermal solar desalination system featuring improved heat recovery...",
             linkEspacenet="https://worldwide.espacenet.com/patent/search?q=pn%3DCN120398169A"
-        )
+        ),
     ]
-    # создаём 25 уникальных элементов
-    items: List[PatentItem] = []
-    for i in range(25):
-        b = base[i % len(base)].model_copy(deep=True)
-        # немного смещаем дату публикации, чтобы сортировка имела смысл
-        date = _parse_date_safe(b.publicationDate)
-        b.publicationDate = (date.replace(year=date.year + (i % 3))).strftime("%Y-%m-%d")
-        b.publicationNumber = f"{b.publicationNumber}-D{i+1}"
-        items.append(b)
-    return items
 
-def _demo_items_with_translation() -> List[PatentItem]:
-    items = _demo_items_raw()
+def _generate_demo_pool(total: int = 75) -> List[PatentItem]:
+    """
+    Генерируем пул из 'total' записей на основе 3 базовых патентов.
+    Даты размазываем по годам/дням, номера уникализируем.
+    """
+    base = _seed_base()
+    pool: List[PatentItem] = []
+    start_date = datetime(2022, 1, 10)
+
+    for i in range(total):
+        b = base[i % len(base)].model_copy(deep=True)
+        # уникализируем номер
+        b.publicationNumber = f"{b.publicationNumber}-D{i+1}"
+        # разбрасываем даты (чтобы была реальная сортировка по новизне)
+        d = start_date + timedelta(days=300 * (i % 4) + 30 * (i % 10))
+        b.publicationDate = d.strftime("%Y-%m-%d")
+        pool.append(b)
+    return pool
+
+def _hydrate_with_translation(items: List[PatentItem]) -> List[PatentItem]:
     for it in items:
         it.abstractOriginal = _clip_en(it.abstractOriginal, 500)
         it.titleRu = _translate_ru(it.titleOriginal)
         it.abstractRu = _translate_ru(it.abstractOriginal)
-    # сортируем по дате публикации (новые → старые)
-    items.sort(key=lambda x: _parse_date_safe(x.publicationDate), reverse=True)
     return items
 
-# ---------- поиск ----------
+def _get_sorted_pool() -> List[PatentItem]:
+    pool = _generate_demo_pool(total=75)              # пул из 75 штук
+    pool = _hydrate_with_translation(pool)            # добавляем переводы
+    pool.sort(key=lambda x: _parse_date_safe(x.publicationDate), reverse=True)  # newest→oldest
+    return pool
+
+# ---------- поиск (POST/GET) с пагинацией ----------
+def _paginate(pool: List[PatentItem], page: int, size: int) -> SearchResponse:
+    size = min(max(size, 1), 25)          # 1..25
+    total = len(pool)
+    start = (page - 1) * size
+    end = start + size
+    items = pool[start:end]
+    next_page = page + 1 if end < total else None
+    return SearchResponse(total=total, page=page, size=size, nextPage=next_page, items=items)
+
 @app.post("/search", response_model=SearchResponse)
 def search_post(payload: dict = Body(...)):
+    # q пока не используется (демо), но оставляем для совместимости
+    _ = payload.get("query", "")
     page = int(payload.get("page", 1))
-    size = min(int(payload.get("size", 25)), 25)
-    all_items = _demo_items_with_translation()
-    return SearchResponse(total=len(all_items), page=page, size=size, nextPage=None, items=all_items[:size])
+    size = int(payload.get("size", 25))
+    pool = _get_sorted_pool()
+    return _paginate(pool, page, size)
 
 @app.get("/search", response_model=SearchResponse)
 def search_get(q: str = Query(""), page: int = 1, size: int = 25):
-    size = min(size, 25)
-    all_items = _demo_items_with_translation()
-    return SearchResponse(total=len(all_items), page=page, size=size, nextPage=None, items=all_items[:size])
+    pool = _get_sorted_pool()
+    return _paginate(pool, page, size)
