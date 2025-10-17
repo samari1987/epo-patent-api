@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import os
 import requests
 import xml.etree.ElementTree as ET
+import re
 
 APP_VERSION = "2.0.1"
 app = FastAPI(title="EPO Patent API", version=APP_VERSION)
@@ -39,18 +40,27 @@ class SearchResponse(BaseModel):
     items: List[PatentItem]
 
 # ========= UTILS =========
-# ---------- утилиты ----------
 _tr = GoogleTranslator(source="auto", target="ru")
 
-import re
+def _translate_ru(text: Optional[str]) -> Optional[str]:
+    """Безопасный автоперевод EN→RU (или auto→RU); обрезка по длине."""
+    if not text:
+        return None
+    try:
+        t = _tr.translate(text.strip())
+        if t and len(t) > 1200:
+            t = t[:1200].rsplit(" ", 1)[0] + "…"
+        return t
+    except Exception:
+        return None
 
 def _build_ops_query(q: str) -> str:
     q_strip = q.strip()
     q_compact = re.sub(r"[\s\-]", "", q_strip).upper()
-    # если это похоже на номер публикации (US12421136B1, WO2025167351A1, CN120398169A и т.п.)
+    # Если похоже на номер публикации (US12421136B1, WO2025167351A1, CN120398169A...)
     if re.match(r"^[A-Z]{2}\d{6,}[A-Z0-9]?$", q_compact):
         return f"pn={q_compact}"
-    # иначе это текстовый запрос → переведём на английский и используем any="..."
+    # Иначе — текстовый поиск: переведём на EN и используем any="..."
     try:
         q_en = GoogleTranslator(source="auto", target="en").translate(q_strip)
     except Exception:
@@ -112,7 +122,7 @@ def _ops_search_raw(query: str, page: int, size: int, token: str) -> requests.Re
         "Accept": "application/xml",
         "Range": f"{start}-{end}",
     }
-    params = {"q": _build_ops_query(query)} # универсальный запрос (название/реферат/текст)
+    params = {"q": _build_ops_query(query)}
     r = requests.get(OPS_SEARCH_URL, headers=headers, params=params, timeout=60)
     r.raise_for_status()
     return r
@@ -143,7 +153,7 @@ def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
         kind = (doc.get("kind") or "").strip()
         pn = f"{country}{docnum}{kind}".strip()
 
-        # дата публикации
+        # Дата публикации
         pub_date = None
         di = doc.find(".//exchange-doc:document-id", ns)
         if di is not None:
@@ -151,7 +161,7 @@ def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
             if dt_el is not None and dt_el.text:
                 pub_date = _fmt_date_iso(dt_el.text)
 
-        # название (en предпочтительно)
+        # Название (EN предпочтительно)
         title = None
         for t in doc.findall(".//exchange-doc:invention-title", ns):
             lang = t.get("{http://www.w3.org/XML/1998/namespace}lang", "").lower()
@@ -162,7 +172,7 @@ def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
             t = doc.find(".//exchange-doc:invention-title", ns)
             title = (t.text or "").strip() if t is not None else "—"
 
-        # абстракт (en, если есть)
+        # Abstract (EN, если есть)
         abstract = None
         for ab in doc.findall(".//exchange-doc:abstract", ns):
             lang = ab.get("{http://www.w3.org/XML/1998/namespace}lang", "").lower()
