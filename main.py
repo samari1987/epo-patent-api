@@ -112,7 +112,7 @@ def _ops_search_raw(query: str, page: int, size: int, token: str) -> requests.Re
         "Accept": "application/xml",
         "Range": f"{start}-{end}",
     }
-    params = {"q": f'any="{query}"'}  # универсальный запрос (название/реферат/текст)
+    params = {"q": _build_ops_query(query)} # универсальный запрос (название/реферат/текст)
     r = requests.get(OPS_SEARCH_URL, headers=headers, params=params, timeout=60)
     r.raise_for_status()
     return r
