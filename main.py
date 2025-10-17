@@ -39,18 +39,23 @@ class SearchResponse(BaseModel):
     items: List[PatentItem]
 
 # ========= UTILS =========
+# ---------- утилиты ----------
 _tr = GoogleTranslator(source="auto", target="ru")
 
-def _translate_ru(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
+import re
+
+def _build_ops_query(q: str) -> str:
+    q_strip = q.strip()
+    q_compact = re.sub(r"[\s\-]", "", q_strip).upper()
+    # если это похоже на номер публикации (US12421136B1, WO2025167351A1, CN120398169A и т.п.)
+    if re.match(r"^[A-Z]{2}\d{6,}[A-Z0-9]?$", q_compact):
+        return f"pn={q_compact}"
+    # иначе это текстовый запрос → переведём на английский и используем any="..."
     try:
-        t = _tr.translate(text.strip())
-        if t and len(t) > 500:
-            t = t[:500].rsplit(" ", 1)[0] + "…"
-        return t
+        q_en = GoogleTranslator(source="auto", target="en").translate(q_strip)
     except Exception:
-        return None
+        q_en = q_strip
+    return f'any="{q_en}"'
 
 def _clip(text: Optional[str], n: int = 1200) -> Optional[str]:
     if not text:
