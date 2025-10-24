@@ -1,29 +1,61 @@
 # main.py — EPO Patent API for "Scientific Innovator"
-# Реальный EPO OPS + fallback demo, пагинация, сортировка по дате (newest→oldest), автоперевод
-# v2.1.0 — улучшенный парсер OPS (устойчивый к структурам exchange-document)
+# v2.0.2
+#
+# Функции:
+#  - /status  : статус сервиса, режим работы ("ops" или "demo")
+#  - /search  : поиск патентов (через EPO OPS, с fallback на демо)
+#
+# Ключи EPO OPS должны быть в переменных окружения:
+#   OPS_CONSUMER_KEY / OPS_CONSUMER_SECRET
+#   или (fallback имена)
+#   CONSUMER_KEY / CONSUMER_SECRET
+#
+# Формат ответа:
+#   SearchResponse {
+#       total, page, size, nextPage, items[PatentItem]
+#   }
+#
+#   PatentItem {
+#       publicationNumber   (например "US12421136B1")
+#       publicationDate     (YYYY-MM-DD)
+#       country             ("US", "WO", ...)
+#       kindCode            ("A1", "B1", ...)
+#       titleOriginal       (оригинальное название)
+#       titleRu             (перевод названия на русский)
+#       abstractOriginal    (абстракт в оригинале)
+#       abstractRu          (перевод абстракта)
+#       linkEspacenet       (кликабельная ссылка на Espacenet)
+#   }
+#
+# Важно:
+#  - если OPS отдал 400/401/... или ключей нет — выдаём fallback-демо,
+#    чтобы ассистент не падал.
+#  - данные сортируются по дате публикации (новые → старые).
+#
+# Это готовый файл: просто положи его как main.py
+# и задеплой.
 
-from fastapi import FastAPI, Body, Query
-from pydantic import BaseModel
-from typing import List, Optional, Tuple
-from deep_translator import GoogleTranslator
-from datetime import datetime, timedelta
 import os
 import requests
 import xml.etree.ElementTree as ET
-import logging
+from datetime import datetime
+from typing import List, Optional
 
-APP_VERSION = "2.1.0"
+from fastapi import FastAPI, Query, Body
+from pydantic import BaseModel
+from deep_translator import GoogleTranslator
+
+
+APP_VERSION = "2.0.2"
 app = FastAPI(title="EPO Patent API", version=APP_VERSION)
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("epo-api")
+# ---------- Pydantic модели ----------
 
-# ========= MODELS =========
 class PatentItem(BaseModel):
     publicationNumber: str
     kindCode: Optional[str] = None
     country: Optional[str] = None
-    publicationDate: Optional[str] = None  # YYYY-MM-DD
+    publicationDate: Optional[str] = None  # "YYYY-MM-DD"
     titleOriginal: str
     titleRu: Optional[str] = None
     abstractOriginal: Optional[str] = None
@@ -35,6 +67,7 @@ class PatentItem(BaseModel):
     linkEspacenet: str
     linkPdf: Optional[str] = None
 
+
 class SearchResponse(BaseModel):
     total: int
     page: int
@@ -42,252 +75,280 @@ class SearchResponse(BaseModel):
     nextPage: Optional[int] = None
     items: List[PatentItem]
 
-# ========= UTILS =========
+
+# ---------- Утилиты ----------
+
 _tr = GoogleTranslator(source="auto", target="ru")
 
 def _translate_ru(text: Optional[str]) -> Optional[str]:
+    """Перевод EN → RU, обрезка до ~500 символов."""
     if not text:
         return None
     try:
         t = _tr.translate(text.strip())
-        if t and len(t) > 1000:
-            t = t[:1000].rsplit(" ", 1)[0] + "…"
+        if t and len(t) > 500:
+            t = t[:500].rsplit(" ", 1)[0] + "…"
         return t
-    except Exception as e:
-        log.debug("translation failed: %s", e)
+    except Exception:
+        # если переводчик упал (лимит, сеть), не ломаем весь ответ
         return None
+
 
 def _clip(text: Optional[str], n: int = 1200) -> Optional[str]:
+    """Нормализуем пробелы и мягко обрезаем до n символов (с завершением по слову)."""
     if not text:
         return None
-    s = " ".join(text.split())
-    return s if len(s) <= n else s[:n].rsplit(" ", 1)[0] + "…"
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "…"
 
-def _parse_date_safe(s: Optional[str]) -> datetime:
-    if not s:
+
+def _parse_date_safe(raw: Optional[str]) -> datetime:
+    """
+    Парсим дату, которая может приходить как YYYYMMDD, YYYY-MM-DD, YYYYMM, YYYY.
+    Если не распознали — возвращаем 1900-01-01, чтобы сортировка не падала.
+    """
+    if not raw:
         return datetime(1900, 1, 1)
-    s = s.strip()
+    raw = raw.strip()
     for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y%m", "%Y"):
         try:
-            return datetime.strptime(s, fmt)
+            return datetime.strptime(raw, fmt)
         except Exception:
-            continue
-    # try common separators
-    try:
-        s2 = s.replace(".", "-").replace("/", "-")
-        return datetime.fromisoformat(s2)
-    except Exception:
-        return datetime(1900, 1, 1)
+            pass
+    return datetime(1900, 1, 1)
 
-def _fmt_date_iso(s: Optional[str]) -> Optional[str]:
-    dt = _parse_date_safe(s)
-    return dt.strftime("%Y-%m-%d") if dt.year > 1900 else None
 
-# ========= OPS (REAL) =========
-OPS_KEY = os.getenv("OPS_CONSUMER_KEY") or os.getenv("CONSUMER_KEY")
+def _fmt_date_iso(raw: Optional[str]) -> Optional[str]:
+    """
+    Возвращаем нормальный ISO-формат YYYY-MM-DD (или None, если дата мусор).
+    """
+    d = _parse_date_safe(raw)
+    return d.strftime("%Y-%m-%d") if d.year > 1900 else None
+
+
+# ---------- OPS credentials / endpoints ----------
+
+OPS_KEY    = os.getenv("OPS_CONSUMER_KEY")    or os.getenv("CONSUMER_KEY")
 OPS_SECRET = os.getenv("OPS_CONSUMER_SECRET") or os.getenv("CONSUMER_SECRET")
-OPS_AUTH_URL = "https://ops.epo.org/3.2/auth/accesstoken"
+
+OPS_AUTH_URL   = "https://ops.epo.org/3.2/auth/accesstoken"
 OPS_SEARCH_URL = "https://ops.epo.org/3.2/rest-services/published-data/search"
 
+
 def _get_ops_token() -> Optional[str]:
+    """
+    Получаем OAuth2 access_token для EPO OPS по client_credentials.
+    Если не получилось — вернём None.
+    """
     if not OPS_KEY or not OPS_SECRET:
-        log.info("OPS keys not configured")
         return None
     try:
         r = requests.post(
             OPS_AUTH_URL,
             data={"grant_type": "client_credentials"},
             auth=(OPS_KEY, OPS_SECRET),
-            timeout=30,
+            timeout=20,
         )
         r.raise_for_status()
-        tok = r.json().get("access_token")
-        log.info("got OPS token")
-        return tok
+        data = r.json()
+        return data.get("access_token")
     except Exception as e:
-        log.exception("failed to get ops token: %s", e)
+        print("epo-api:get_ops_token ERROR:", e)
         return None
 
-def _build_ops_query(q: str) -> str:
-    if not q:
-        return 'cpc=G'  # fallback tiny query (shouldn't happen)
-    q_strip = q.strip()
-    # if looks like publication number
-    import re
-    compact = re.sub(r"[\s\-]", "", q_strip).upper()
-    if re.match(r"^[A-Z]{2}\d{4,}\w*$", compact):
-        return f"pn={compact}"
-    # otherwise translate to english and use any=""
-    try:
-        q_en = GoogleTranslator(source="auto", target="en").translate(q_strip)
-    except Exception:
-        q_en = q_strip
-    return f'any="{q_en}"'
 
-def _ops_search_raw(query: str, page: int, size: int, token: str) -> requests.Response:
+def _ops_search_raw(query_text: str, page: int, size: int, token: str) -> str:
+    """
+    Делаем сырой GET к OPS /published-data/search.
+    Возвращаем XML-строку (text).
+    Можем кинуть HTTPError, если статус >=400.
+    """
+
+    # Диапазон для Range-заголовка: 1-25, 26-50 и т.д.
     start = (page - 1) * size + 1
-    end = start + size - 1
+    end   = start + size - 1
+    range_header = f"{start}-{end}"
+
+    # Параметр q: any="solar desalination"
+    # Запрос будет закодирован requests сам.
+    params = {
+        "q": f'any="{query_text}"'
+    }
+
     headers = {
+        # Bearer (важно именно так, без "Bearer=")
         "Authorization": f"Bearer {token}",
         "Accept": "application/xml",
-        "Range": f"{start}-{end}",
+        # OPS любит Range; если слишком нагло попросим — может дать 400
+        "Range": range_header,
     }
-    params = {"q": _build_ops_query(query)}
-    log.info("OPS search params: %s; Range: %s-%s", params, start, end)
-    r = requests.get(OPS_SEARCH_URL, headers=headers, params=params, timeout=60)
-    r.raise_for_status()
-    return r
 
-# robust parser for exchange-document
-def _parse_ops_xml(xml_text: str) -> Tuple[List[PatentItem], int]:
+    r = requests.get(
+        OPS_SEARCH_URL,
+        headers=headers,
+        params=params,
+        timeout=30
+    )
+
+    # Если 4xx/5xx — выкинем HTTPError
+    if r.status_code >= 400:
+        print("OPS SEARCH ERROR:", r.status_code, r.text[:500])
+        r.raise_for_status()
+
+    return r.text
+
+
+def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
+    """
+    Парсер XML ответа OPS.
+    Возвращает:
+        - список PatentItem
+        - total (общее число результатов)
+    Если парсинг не удался — вернём ([], 0).
+    """
+
+    # В ответах OPS используются пространства имён:
+    # xmlns="http://ops.epo.org" и "http://www.epo.org/exchange"
     ns = {
         "ops": "http://ops.epo.org",
-        "exchange": "http://www.epo.org/exchange",
+        "ex":  "http://www.epo.org/exchange",
     }
-    root = ET.fromstring(xml_text)
 
-    # Try to get total result count from various places
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception as e:
+        print("XML parse fail:", e)
+        return [], 0
+
+    # Достаём общее количество результатов
     total = 0
-    # some responses include attribute total-result-count
-    for key in ("total-result-count", "total-result-size"):
-        val = root.attrib.get(key)
-        if val and val.isdigit():
-            total = int(val)
+    for attr in ["total-result-count", "total-result-size"]:
+        v = root.attrib.get(attr)
+        if v and v.isdigit():
+            total = int(v)
             break
     if total == 0:
         tr = root.find(".//ops:total-result-count", ns)
         if tr is not None and tr.text and tr.text.isdigit():
             total = int(tr.text)
 
-    items: List[PatentItem] = []
+    out_items: List[PatentItem] = []
 
-    # find exchange-document elements (EPO XML can be nested)
-    docs = root.findall(".//exchange:exchange-document", ns) or root.findall(".//{http://www.epo.org/exchange}exchange-document")
-    for doc in docs:
-        try:
-            country = (doc.get("country") or "").strip()
-            docnum = (doc.get("doc-number") or "").strip()
-            kind = (doc.get("kind") or "").strip()
-            pn = f"{country}{docnum}{kind}".strip()
+    # Документы обычно лежат как ex:exchange-document
+    for doc in root.findall(".//ex:exchange-document", ns):
+        country = (doc.get("country") or "").strip()
+        docnum  = (doc.get("doc-number") or "").strip()
+        kind    = (doc.get("kind") or "").strip()
+        pn      = f"{country}{docnum}{kind}"
 
-            # publication date: try bibliographic-data -> publication-reference -> document-id -> date
-            pub_date = None
-            bibl = doc.find(".//exchange:bibliographic-data", ns) or doc.find(".//{http://www.epo.org/exchange}bibliographic-data")
-            if bibl is not None:
-                pub_ref = bibl.find(".//exchange:publication-reference", ns)
-                if pub_ref is not None:
-                    docid = pub_ref.find(".//exchange:document-id", ns)
-                    if docid is not None:
-                        date_el = docid.find(".//exchange:date", ns)
-                        if date_el is not None and date_el.text:
-                            pub_date = _fmt_date_iso(date_el.text)
+        # Пытаемся достать дату публикации
+        pub_date = None
+        di = doc.find(".//ex:document-id", ns)
+        if di is not None:
+            dt_el = di.find(".//ex:date", ns)
+            if dt_el is not None and dt_el.text:
+                pub_date = _fmt_date_iso(dt_el.text)
 
-            # fallback: any document-id/date under the document
-            if not pub_date:
-                dt_el = doc.find(".//exchange:document-id//exchange:date", ns)
-                if dt_el is not None and dt_el.text:
-                    pub_date = _fmt_date_iso(dt_el.text)
+        # Заголовок. Предпочтительно lang="en", иначе любой
+        title_val = None
+        for t in doc.findall(".//ex:invention-title", ns):
+            lang = (t.get("{http://www.w3.org/XML/1998/namespace}lang") or "").lower()
+            cand = (t.text or "").strip()
+            if not title_val:
+                title_val = cand
+            if lang == "en" and cand:
+                title_val = cand
+                break
+        if not title_val:
+            title_val = "—"
 
-            # another fallback: first date element
-            if not pub_date:
-                dt_el2 = doc.find(".//exchange:date", ns)
-                if dt_el2 is not None and dt_el2.text:
-                    pub_date = _fmt_date_iso(dt_el2.text)
+        # Абстракт. Тоже сначала берём en, если есть.
+        abstract_val = None
+        for ab in doc.findall(".//ex:abstract", ns):
+            lang = (ab.get("{http://www.w3.org/XML/1998/namespace}lang") or "").lower()
+            parts = []
+            for p in ab.findall(".//ex:p", ns):
+                if p.text:
+                    parts.append(p.text.strip())
+            joined = " ".join(parts).strip()
+            if not abstract_val and joined:
+                abstract_val = joined
+            if lang == "en" and joined:
+                abstract_val = joined
+                break
 
-            # title: prefer english invention-title
-            title = None
-            for t in doc.findall(".//exchange:invention-title", ns):
-                lang = t.get("{http://www.w3.org/XML/1998/namespace}lang", "").lower()
-                if lang == "en" and (t.text or "").strip():
-                    title = (t.text or "").strip()
-                    break
-            if not title:
-                t_any = doc.find(".//exchange:invention-title", ns)
-                title = (t_any.text or "").strip() if t_any is not None and t_any.text else "—"
+        abstract_val = _clip(abstract_val, 1200)
 
-            # abstract: gather paragraphs; prefer en
-            abstract = None
-            # iterate all abstract elements and prefer English
-            for ab in doc.findall(".//exchange:abstract", ns):
-                lang = ab.get("{http://www.w3.org/XML/1998/namespace}lang", "").lower()
-                parts = []
-                for p in ab.findall(".//exchange:p", ns):
-                    if p.text:
-                        parts.append(p.text.strip())
-                joined = " ".join(parts).strip()
-                if joined:
-                    if lang == "en":
-                        abstract = joined
-                        break
-                    if not abstract:
-                        abstract = joined
-            # fallback: try to read any text content of abstract node
-            if not abstract:
-                ab_any = doc.find(".//exchange:abstract", ns)
-                if ab_any is not None:
-                    texts = []
-                    for p in ab_any.findall(".//exchange:p", ns):
-                        if p.text:
-                            texts.append(p.text.strip())
-                    if texts:
-                        abstract = " ".join(texts).strip()
+        link_esp = f"https://worldwide.espacenet.com/patent/search?q=pn%3D{pn}"
 
-            link = f"https://worldwide.espacenet.com/patent/search?q=pn%3D{pn}"
+        item = PatentItem(
+            publicationNumber = pn,
+            kindCode          = kind or None,
+            country           = country or None,
+            publicationDate   = pub_date,
+            titleOriginal     = title_val,
+            abstractOriginal  = abstract_val,
+            linkEspacenet     = link_esp,
+        )
+        out_items.append(item)
 
-            item = PatentItem(
-                publicationNumber=pn or (docnum + (kind or "")),
-                kindCode=kind or None,
-                country=country or None,
-                publicationDate=pub_date,
-                titleOriginal=title,
-                abstractOriginal=_clip(abstract, 1200),
-                linkEspacenet=link,
-            )
-            items.append(item)
-        except Exception as e:
-            log.exception("failed to parse one exchange-document: %s", e)
-            continue
+    # сортируем newest → oldest
+    out_items.sort(
+        key=lambda it: _parse_date_safe(it.publicationDate),
+        reverse=True
+    )
 
-    # sort by date newest -> oldest
-    items.sort(key=lambda x: _parse_date_safe(x.publicationDate), reverse=True)
-    if total == 0:
-        total = len(items)
-    return items, total
+    return out_items, total
+
 
 def fetch_real_patents(query: str, page: int, size: int) -> Optional[SearchResponse]:
+    """
+    Пытаемся получить реальные патенты через OPS.
+    Если всё ОК — вернём SearchResponse.
+    Если не ОК (нет токена, 400, др. ошибка) — вернём None.
+    """
     token = _get_ops_token()
     if not token:
-        return None
-    try:
-        r = _ops_search_raw(query=query, page=page, size=size, token=token)
-    except requests.HTTPError as he:
-        log.exception("OPS search HTTP error: %s", he)
-        return None
-    except Exception as e:
-        log.exception("OPS search failed: %s", e)
+        # нет ключей или не дали токен
         return None
 
     try:
-        items, total = _parse_ops_xml(r.text)
+        xml_text = _ops_search_raw(
+            query_text=query,
+            page=page,
+            size=size,
+            token=token
+        )
     except Exception as e:
-        log.exception("failed to parse OPS XML: %s", e)
+        print("OPS fetch error:", e)
         return None
 
-    # translate where missing
+    items, total = _parse_ops_xml(xml_text)
+
+    # переводим названия и абстракты
     for it in items:
-        if not it.titleRu:
-            it.titleRu = _translate_ru(it.titleOriginal)
-        if not it.abstractRu:
-            it.abstractRu = _translate_ru(it.abstractOriginal)
+        it.titleRu    = _translate_ru(it.titleOriginal)
+        it.abstractRu = _translate_ru(it.abstractOriginal)
 
-    # compute next page reliably using total
+    # считаем nextPage
     start = (page - 1) * size + 1
     next_page = page + 1 if (start - 1 + len(items)) < total else None
-    return SearchResponse(total=total, page=page, size=size, nextPage=next_page, items=items[:size])
 
-# ========= DEMO (FALLBACK) =========
-def _seed_demo() -> List[PatentItem]:
-    return [
+    return SearchResponse(
+        total    = total,
+        page     = page,
+        size     = size,
+        nextPage = next_page,
+        items    = items[:size],
+    )
+
+
+# ---------- DEMO fallback ----------
+# Если OPS не сработал, мы отдаём стабильную демо-выборку,
+# чтобы ассистент не разваливался и мог продолжать анализ.
+
+def _demo_pool() -> List[PatentItem]:
+    demo = [
         PatentItem(
             publicationNumber="CN120398169A",
             kindCode="A",
@@ -317,64 +378,95 @@ def _seed_demo() -> List[PatentItem]:
         ),
     ]
 
-def _demo_pool(total: int = 75) -> List[PatentItem]:
-    base = _seed_demo()
-    pool: List[PatentItem] = []
-    start_dt = datetime(2022, 1, 10)
-    # NOTE: demo entries are copies but KEEP original publicationNumber and title — no -D suffix in demo
-    for i in range(total):
-        b = base[i % len(base)].model_copy(deep=True)
-        # shift date to create ordering but keep publicationNumber as original
-        d = start_dt + timedelta(days=220 * (i % 6) + 13 * i)
-        b.publicationDate = d.strftime("%Y-%m-%d")
-        pool.append(b)
-    pool.sort(key=lambda x: _parse_date_safe(x.publicationDate), reverse=True)
-    for it in pool:
-        if not it.titleRu:
-            it.titleRu = _translate_ru(it.titleOriginal)
-        if not it.abstractRu:
-            it.abstractRu = _translate_ru(it.abstractOriginal)
-    return pool
+    # сортируем по дате публикации (новые сначала)
+    demo.sort(
+        key=lambda it: _parse_date_safe(it.publicationDate),
+        reverse=True
+    )
 
-def _paginate(pool: List[PatentItem], page: int, size: int) -> SearchResponse:
-    size = min(max(size, 1), 25)
+    # переводы
+    for it in demo:
+        it.titleRu    = _translate_ru(it.titleOriginal)
+        it.abstractRu = _translate_ru(it.abstractOriginal)
+
+    return demo
+
+
+def _paginate_demo(page: int, size: int) -> SearchResponse:
+    pool = _demo_pool()
     total = len(pool)
     start = (page - 1) * size
-    end = start + size
+    end   = start + size
     items = pool[start:end]
-    next_page = page + 1 if end < total else None
-    return SearchResponse(total=total, page=page, size=size, nextPage=next_page, items=items)
+    nextp = page + 1 if end < total else None
 
-# ========= ENDPOINTS =========
+    return SearchResponse(
+        total    = total,
+        page     = page,
+        size     = size,
+        nextPage = nextp,
+        items    = items,
+    )
+
+
+# ---------- ENDPOINTS FastAPI ----------
+
 @app.get("/status")
 def status():
+    """
+    Быстрый "здоров ли сервис".
+    mode:
+      - "ops"  если у нас есть OPS ключи и мы потенциально можем звать EPO
+      - "demo" если нет ключей (или они не заданы в Render env)
+    """
     mode = "ops" if OPS_KEY and OPS_SECRET else "demo"
-    return {"status": "ok", "service": "epo", "mode": mode, "version": APP_VERSION}
+    return {
+        "status": "ok",
+        "service": "epo",
+        "mode": mode,
+        "version": APP_VERSION,
+        "time": datetime.utcnow().isoformat()
+    }
+
 
 @app.post("/search", response_model=SearchResponse)
 def search_post(payload: dict = Body(...)):
-    query = payload.get("query", "") or payload.get("q", "")
-    page = int(payload.get("page", 1))
-    size = int(payload.get("size", 25))
-    # try real OPS
-    try:
-        sr = fetch_real_patents(query=query, page=page, size=size)
-        if sr:
-            return sr
-    except Exception:
-        log.exception("fetch_real_patents failed — falling back to demo")
+    """
+    POST /search
+    payload:
+      {
+        "query": "solar desalination",
+        "page": 1,
+        "size": 25
+      }
 
-    pool = _demo_pool(total=75)
-    return _paginate(pool, page, size)
+    Возвращает SearchResponse.
+    """
+    query = payload.get("query", "")
+    page  = int(payload.get("page", 1))
+    size  = int(payload.get("size", 25))
+
+    # Пытаемся сходить в реальную OPS
+    sr = fetch_real_patents(query=query, page=page, size=size)
+    if sr:
+        return sr
+
+    # Если OPS не дал — fallback демо
+    return _paginate_demo(page=page, size=size)
+
 
 @app.get("/search", response_model=SearchResponse)
-def search_get(q: str = Query(""), page: int = 1, size: int = 25):
-    try:
-        sr = fetch_real_patents(query=q, page=page, size=size)
-        if sr:
-            return sr
-    except Exception:
-        log.exception("fetch_real_patents failed — falling back to demo")
+def search_get(
+    q: str = Query(""),
+    page: int = 1,
+    size: int = 25
+):
+    """
+    GET /search?q=...&page=1&size=25
+    Такой же смысл, но через query-параметры.
+    """
+    sr = fetch_real_patents(query=q, page=page, size=size)
+    if sr:
+        return sr
 
-    pool = _demo_pool(total=75)
-    return _paginate(pool, page, size)
+    return _paginate_demo(page=page, size=size)
