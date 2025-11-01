@@ -1,14 +1,13 @@
 # main.py — EPO Patent API for "Scientific Innovator"
-# v2.0.2
+# v2.1.0
 #
-# Функции:
-#  - /status  : статус сервиса, режим работы ("ops" или "demo")
-#  - /search  : поиск патентов (через EPO OPS, с fallback на демо)
+# Что умеет:
+#  - /status  : статус сервиса, режим ("ops" или "demo")
+#  - /search  : поиск патентов через EPO OPS с fallback на демо
 #
-# Ключи EPO OPS должны быть в переменных окружения:
+# Переменные окружения для EPO OPS:
 #   OPS_CONSUMER_KEY / OPS_CONSUMER_SECRET
-#   или (fallback имена)
-#   CONSUMER_KEY / CONSUMER_SECRET
+#   (или синонимы)  CONSUMER_KEY / CONSUMER_SECRET
 #
 # Формат ответа:
 #   SearchResponse {
@@ -16,37 +15,29 @@
 #   }
 #
 #   PatentItem {
-#       publicationNumber   (например "US12421136B1")
-#       publicationDate     (YYYY-MM-DD)
-#       country             ("US", "WO", ...)
-#       kindCode            ("A1", "B1", ...)
-#       titleOriginal       (оригинальное название)
-#       titleRu             (перевод названия на русский)
-#       abstractOriginal    (абстракт в оригинале)
-#       abstractRu          (перевод абстракта)
-#       linkEspacenet       (кликабельная ссылка на Espacenet)
+#       publicationNumber, publicationDate(YYYY-MM-DD), country, kindCode,
+#       titleOriginal, titleRu, abstractOriginal, abstractRu, linkEspacenet
 #   }
 #
 # Важно:
-#  - если OPS отдал 400/401/... или ключей нет — выдаём fallback-демо,
-#    чтобы ассистент не падал.
-#  - данные сортируются по дате публикации (новые → старые).
-#
-# Это готовый файл: просто положи его как main.py
-# и задеплой.
+#  - CQL (OPS) формируем корректно: ti=.../ab=... с OR;
+#  - если OPS недоступен (нет токена, 400, и т.д.) — отдаём демо;
+#  - сортируем newest → oldest;
+#  - аккуратный перевод GoogleTranslator (обрезка 500 символов).
 
 import os
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from urllib.parse import quote_plus
 
-from fastapi import FastAPI, Query, Body
+from fastapi import FastAPI, Query, Body, HTTPException
 from pydantic import BaseModel
 from deep_translator import GoogleTranslator
 
 
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.1.0"
 app = FastAPI(title="EPO Patent API", version=APP_VERSION)
 
 # ---------- Pydantic модели ----------
@@ -90,7 +81,6 @@ def _translate_ru(text: Optional[str]) -> Optional[str]:
             t = t[:500].rsplit(" ", 1)[0] + "…"
         return t
     except Exception:
-        # если переводчик упал (лимит, сеть), не ломаем весь ответ
         return None
 
 
@@ -104,8 +94,8 @@ def _clip(text: Optional[str], n: int = 1200) -> Optional[str]:
 
 def _parse_date_safe(raw: Optional[str]) -> datetime:
     """
-    Парсим дату, которая может приходить как YYYYMMDD, YYYY-MM-DD, YYYYMM, YYYY.
-    Если не распознали — возвращаем 1900-01-01, чтобы сортировка не падала.
+    Парсим дату: YYYYMMDD, YYYY-MM-DD, YYYYMM, YYYY.
+    На нераспознаваемое — 1900-01-01 (чтобы сортировка не падала).
     """
     if not raw:
         return datetime(1900, 1, 1)
@@ -119,9 +109,7 @@ def _parse_date_safe(raw: Optional[str]) -> datetime:
 
 
 def _fmt_date_iso(raw: Optional[str]) -> Optional[str]:
-    """
-    Возвращаем нормальный ISO-формат YYYY-MM-DD (или None, если дата мусор).
-    """
+    """Возвращаем ISO YYYY-MM-DD (или None, если дата мусор)."""
     d = _parse_date_safe(raw)
     return d.strftime("%Y-%m-%d") if d.year > 1900 else None
 
@@ -136,10 +124,7 @@ OPS_SEARCH_URL = "https://ops.epo.org/3.2/rest-services/published-data/search"
 
 
 def _get_ops_token() -> Optional[str]:
-    """
-    Получаем OAuth2 access_token для EPO OPS по client_credentials.
-    Если не получилось — вернём None.
-    """
+    """OAuth2 access_token для EPO OPS (client_credentials)."""
     if not OPS_KEY or not OPS_SECRET:
         return None
     try:
@@ -157,31 +142,52 @@ def _get_ops_token() -> Optional[str]:
         return None
 
 
+# ---------- CQL построение запроса ----------
+
+def _build_cql_from_query(q: str) -> str:
+    """
+    Переводим пользовательский текст в корректный CQL для OPS.
+    Пример: "solar desalination lithium"
+    -> "ti=solar or ab=solar or ti=desalination or ab=desalination or ti=lithium or ab=lithium"
+    """
+    # очень простая токенизация: убираем запятые и разбиваем по пробелам
+    words = [w.strip() for w in q.replace(",", " ").split() if len(w.strip()) > 2]
+    if not words:
+        # пустой запрос — вернём что-то безопасное
+        return "ti=water or ab=water"
+
+    parts = []
+    for w in words:
+        # можно усложнить (фразы в кавычках, AND/OR), но для стабильности — OR по ti/ab
+        parts.append(f"ti={w}")
+        parts.append(f"ab={w}")
+
+    cql = " or ".join(parts)
+    return cql
+
+
 def _ops_search_raw(query_text: str, page: int, size: int, token: str) -> str:
     """
-    Делаем сырой GET к OPS /published-data/search.
-    Возвращаем XML-строку (text).
-    Можем кинуть HTTPError, если статус >=400.
+    GET к OPS /published-data/search.
+    Возвращаем XML-строку, либо кидаем HTTPError при 4xx/5xx.
     """
-
-    # Диапазон для Range-заголовка: 1-25, 26-50 и т.д.
+    # Range: 1-25, 26-50, ...
     start = (page - 1) * size + 1
     end   = start + size - 1
     range_header = f"{start}-{end}"
 
-    # Параметр q: any="solar desalination"
-    # Запрос будет закодирован requests сам.
-    params = {
-        "q": f'any="{query_text}"'
-    }
+    # Собираем CQL и кодируем (в params — requests сам закодирует, но лог выводим «как есть»)
+    cql = _build_cql_from_query(query_text)
+    params = {"q": cql}
 
     headers = {
-        # Bearer (важно именно так, без "Bearer=")
         "Authorization": f"Bearer {token}",
         "Accept": "application/xml",
-        # OPS любит Range; если слишком нагло попросим — может дать 400
         "Range": range_header,
     }
+
+    # Для удобного дебага видим, что реально отправляем:
+    print(f"[OPS] Range={range_header}  CQL={cql}")
 
     r = requests.get(
         OPS_SEARCH_URL,
@@ -189,26 +195,20 @@ def _ops_search_raw(query_text: str, page: int, size: int, token: str) -> str:
         params=params,
         timeout=30
     )
-
-    # Если 4xx/5xx — выкинем HTTPError
     if r.status_code >= 400:
-        print("OPS SEARCH ERROR:", r.status_code, r.text[:500])
+        print("OPS SEARCH ERROR:", r.status_code, r.text[:600])
         r.raise_for_status()
 
     return r.text
 
 
-def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
-    """
-    Парсер XML ответа OPS.
-    Возвращает:
-        - список PatentItem
-        - total (общее число результатов)
-    Если парсинг не удался — вернём ([], 0).
-    """
+# ---------- Парсер XML ответа OPS ----------
 
-    # В ответах OPS используются пространства имён:
-    # xmlns="http://ops.epo.org" и "http://www.epo.org/exchange"
+def _parse_ops_xml(xml_text: str) -> Tuple[List[PatentItem], int]:
+    """
+    Парсим XML OPS.
+    Возвращаем (items, total). На неудачу — ([], 0).
+    """
     ns = {
         "ops": "http://ops.epo.org",
         "ex":  "http://www.epo.org/exchange",
@@ -220,7 +220,7 @@ def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
         print("XML parse fail:", e)
         return [], 0
 
-    # Достаём общее количество результатов
+    # total-результаты
     total = 0
     for attr in ["total-result-count", "total-result-size"]:
         v = root.attrib.get(attr)
@@ -234,14 +234,13 @@ def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
 
     out_items: List[PatentItem] = []
 
-    # Документы обычно лежат как ex:exchange-document
     for doc in root.findall(".//ex:exchange-document", ns):
         country = (doc.get("country") or "").strip()
         docnum  = (doc.get("doc-number") or "").strip()
         kind    = (doc.get("kind") or "").strip()
         pn      = f"{country}{docnum}{kind}"
 
-        # Пытаемся достать дату публикации
+        # дата публикации
         pub_date = None
         di = doc.find(".//ex:document-id", ns)
         if di is not None:
@@ -249,12 +248,12 @@ def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
             if dt_el is not None and dt_el.text:
                 pub_date = _fmt_date_iso(dt_el.text)
 
-        # Заголовок. Предпочтительно lang="en", иначе любой
+        # title (предпочтительно en)
         title_val = None
         for t in doc.findall(".//ex:invention-title", ns):
             lang = (t.get("{http://www.w3.org/XML/1998/namespace}lang") or "").lower()
             cand = (t.text or "").strip()
-            if not title_val:
+            if not title_val and cand:
                 title_val = cand
             if lang == "en" and cand:
                 title_val = cand
@@ -262,7 +261,7 @@ def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
         if not title_val:
             title_val = "—"
 
-        # Абстракт. Тоже сначала берём en, если есть.
+        # abstract (предпочтительно en)
         abstract_val = None
         for ab in doc.findall(".//ex:abstract", ns):
             lang = (ab.get("{http://www.w3.org/XML/1998/namespace}lang") or "").lower()
@@ -292,47 +291,39 @@ def _parse_ops_xml(xml_text: str) -> (List[PatentItem], int):
         )
         out_items.append(item)
 
-    # сортируем newest → oldest
-    out_items.sort(
-        key=lambda it: _parse_date_safe(it.publicationDate),
-        reverse=True
-    )
-
+    # newest → oldest
+    out_items.sort(key=lambda it: _parse_date_safe(it.publicationDate), reverse=True)
     return out_items, total
 
 
+# ---------- Обёртка получения из OPS ----------
+
 def fetch_real_patents(query: str, page: int, size: int) -> Optional[SearchResponse]:
-    """
-    Пытаемся получить реальные патенты через OPS.
-    Если всё ОК — вернём SearchResponse.
-    Если не ОК (нет токена, 400, др. ошибка) — вернём None.
-    """
+    """Возвращает SearchResponse из OPS или None при ошибке/отсутствии токена."""
     token = _get_ops_token()
     if not token:
-        # нет ключей или не дали токен
         return None
 
     try:
-        xml_text = _ops_search_raw(
-            query_text=query,
-            page=page,
-            size=size,
-            token=token
-        )
-    except Exception as e:
+        xml_text = _ops_search_raw(query_text=query, page=page, size=size, token=token)
+    except requests.HTTPError as e:
+        # 400 — чаще всего синтаксис запроса; не роняем, вернём None (демо подхватится)
         print("OPS fetch error:", e)
+        return None
+    except Exception as e:
+        print("OPS fetch error (network):", e)
         return None
 
     items, total = _parse_ops_xml(xml_text)
 
-    # переводим названия и абстракты
+    # Переводы
     for it in items:
         it.titleRu    = _translate_ru(it.titleOriginal)
         it.abstractRu = _translate_ru(it.abstractOriginal)
 
-    # считаем nextPage
-    start = (page - 1) * size + 1
-    next_page = page + 1 if (start - 1 + len(items)) < total else None
+    # nextPage
+    start_index = (page - 1) * size + 1
+    next_page = page + 1 if (start_index - 1 + len(items)) < total else None
 
     return SearchResponse(
         total    = total,
@@ -344,8 +335,6 @@ def fetch_real_patents(query: str, page: int, size: int) -> Optional[SearchRespo
 
 
 # ---------- DEMO fallback ----------
-# Если OPS не сработал, мы отдаём стабильную демо-выборку,
-# чтобы ассистент не разваливался и мог продолжать анализ.
 
 def _demo_pool() -> List[PatentItem]:
     demo = [
@@ -377,18 +366,10 @@ def _demo_pool() -> List[PatentItem]:
             linkEspacenet="https://worldwide.espacenet.com/patent/search?q=pn%3DUS12421136B1",
         ),
     ]
-
-    # сортируем по дате публикации (новые сначала)
-    demo.sort(
-        key=lambda it: _parse_date_safe(it.publicationDate),
-        reverse=True
-    )
-
-    # переводы
+    demo.sort(key=lambda it: _parse_date_safe(it.publicationDate), reverse=True)
     for it in demo:
         it.titleRu    = _translate_ru(it.titleOriginal)
         it.abstractRu = _translate_ru(it.abstractOriginal)
-
     return demo
 
 
@@ -413,12 +394,7 @@ def _paginate_demo(page: int, size: int) -> SearchResponse:
 
 @app.get("/status")
 def status():
-    """
-    Быстрый "здоров ли сервис".
-    mode:
-      - "ops"  если у нас есть OPS ключи и мы потенциально можем звать EPO
-      - "demo" если нет ключей (или они не заданы в Render env)
-    """
+    """Проверка готовности сервиса."""
     mode = "ops" if OPS_KEY and OPS_SECRET else "demo"
     return {
         "status": "ok",
@@ -435,38 +411,28 @@ def search_post(payload: dict = Body(...)):
     POST /search
     payload:
       {
-        "query": "solar desalination",
+        "query": "solar desalination lithium",
         "page": 1,
         "size": 25
       }
-
-    Возвращает SearchResponse.
     """
     query = payload.get("query", "")
     page  = int(payload.get("page", 1))
     size  = int(payload.get("size", 25))
 
-    # Пытаемся сходить в реальную OPS
+    # Сначала реальный OPS
     sr = fetch_real_patents(query=query, page=page, size=size)
     if sr:
         return sr
 
-    # Если OPS не дал — fallback демо
+    # Fallback
     return _paginate_demo(page=page, size=size)
 
 
 @app.get("/search", response_model=SearchResponse)
-def search_get(
-    q: str = Query(""),
-    page: int = 1,
-    size: int = 25
-):
-    """
-    GET /search?q=...&page=1&size=25
-    Такой же смысл, но через query-параметры.
-    """
+def search_get(q: str = Query(""), page: int = 1, size: int = 25):
+    """GET /search?q=...&page=1&size=25"""
     sr = fetch_real_patents(query=q, page=page, size=size)
     if sr:
         return sr
-
     return _paginate_demo(page=page, size=size)
